@@ -1,0 +1,10 @@
+{
+  "name": "proxywar-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "license": "MIT",
+  "description": "Self-contained ProxyWar agent starter. Edit chooseAction() in starter-player.mjs.",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
