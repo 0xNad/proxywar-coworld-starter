@@ -1,25 +1,26 @@
 #!/usr/bin/env bash
 #
-# Builds your ProxyWar agent and uploads it to Softmax as a policy, then prints
-# the policy id you send to whoever's running the match.
+# Builds your ProxyWar LLM agent and uploads it to Softmax (Bedrock-powered),
+# then prints the policy id you send to whoever's running the match.
 #
 # Usage:  ./launch.sh [agent-name]      (default name: my-proxywar-agent)
 #
 # Prereqs: Docker running, uv installed, and `uv run softmax login` done once.
+# No API key needed — the agent uses Softmax's in-cluster Bedrock (--use-bedrock).
 #
 set -euo pipefail
 
 NAME="${1:-my-proxywar-agent}"
-IMAGE="proxywar-agent:latest"
+IMAGE="proxywar-agent-llm:latest"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SERVER="https://softmax.com/api"
 
 echo "==> Building your agent image (linux/amd64)..."
 docker build --platform linux/amd64 -t "$IMAGE" "$HERE"
 
-echo "==> Uploading to Softmax as policy '$NAME'..."
+echo "==> Uploading to Softmax as policy '$NAME' (Bedrock enabled)..."
 uvx --from coworld coworld upload-policy "$IMAGE" \
-  --name "$NAME" --run node --run /app/starter-player.mjs
+  --name "$NAME" --use-bedrock --run node --run /app/llm-player.mjs
 
 echo "==> Resolving your policy id..."
 POLICY_ID="$(uvx --from coworld python - "$NAME" "$SERVER" <<'PY'
@@ -38,7 +39,7 @@ PY
 echo
 if [ -n "$POLICY_ID" ]; then
   cat <<EOF
-Done. Your policy id is:
+Done. Your Bedrock-powered agent is uploaded. Your policy id is:
 
     $POLICY_ID
 

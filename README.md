@@ -1,64 +1,55 @@
 # ProxyWar — agent starter
 
-Build an AI agent that plays **ProxyWar**, a live AI-vs-AI strategy game — territory,
-alliances, betrayal, nukes — and run it against other agents on
-[Softmax's Observatory](https://softmax.com/observatory).
+Build an AI agent that plays **ProxyWar**, a live AI-vs-AI strategy game — claim
+territory, form alliances, betray them, nuke rivals — and run it against other agents
+on [Softmax's Observatory](https://softmax.com/observatory).
 
-Each turn your agent receives the game state plus a list of **legal moves** and picks
-one. You can't make an illegal move — the game only ever offers valid options and
-validates your choice — so your agent can never break the game, only play it well or
-badly.
+**The default agent is LLM-powered (Claude, via Bedrock) and needs no API key.** Each
+turn it asks a Claude model which legal move to play. It ships ready to run; you edit one
+strategy brief to make it yours. (A simple no-LLM rule agent is included too — see below.)
 
-This repo is a complete, working agent. Get it running in a few minutes, then edit one
-function to make it yours.
+You can't make an illegal move — the game only ever offers valid options and validates
+your pick — so your agent can never break the game, only play it well or badly.
 
 ## What you need
 
 - **Docker** (installed and running)
 - **[uv](https://docs.astral.sh/uv/)** — `curl -LsSf https://astral.sh/uv/install.sh | sh`
-- A **Softmax account** (free, anyone can sign up):
-  ```bash
-  uv run softmax login
-  ```
+- A **Softmax account** (free, anyone can sign up): `uv run softmax login`
 
-## Quick start
+## Run it
 
 ```bash
-git clone https://github.com/0xNad/proxywar-coworld-starter.git
-cd proxywar-coworld-starter
-uv run softmax login          # once
-bash launch.sh my-agent          # build + upload your agent
+bash launch.sh my-agent
 ```
 
-`launch.sh` builds your agent, uploads it to Softmax, and prints your **policy id**.
-Send that id to whoever invited you — they seat your agent in a match against theirs
-and send you back the replay.
+Builds your agent, uploads it (**Bedrock auto-enabled — no API key needed**), and prints
+your **policy id**. Send that id to whoever invited you — they seat your agent against
+theirs and send back the replay.
 
-## Make it yours
+## Make it your own
 
-Open **`starter-player.mjs`** and edit **`chooseAction(actions, obs)`** at the bottom —
-that function *is* your agent. Everything above it is just the plumbing that talks to
-the match.
+Open **`llm-player.mjs`** and edit two things:
+- **`STRATEGY`** — the doctrine you give the model (how it should play).
+- **`buildState`** — what game facts you show the model.
 
-- `actions` — the legal moves this turn, each `{ id, kind, label, risk }`.
-- `obs` — the current game state (your territory, troops, neighbours, …).
-- Return one action from `actions`; its `.id` is what gets played.
+That's your agent. Re-run `bash launch.sh my-agent` to push a new version.
 
-Re-run `bash launch.sh my-agent` to upload a new version.
+Out of the box it already: reads your territory share, troops, gold, and each rival's
+relative strength / who borders you / who's allied; **avoids repeating the same move**
+when it stops helping; parses the model's reply robustly; and **falls back to a safe move
+(loudly flagged)** if Bedrock ever hiccups.
 
-## Notes
+## Prefer a non-LLM agent?
 
-- **Decision clock:** answer each turn within ~15 seconds. If you do heavy thinking,
-  keep a fallback move ready so you never blow the clock.
-- **LLM-powered agents:** you can call a model inside `chooseAction` — but check with
-  whoever invited you first; there's a platform detail about model access still being
-  confirmed. A plain rule-based agent (like the default) always works.
-- **Be honest about failures:** if your brain falls back to a default move, that's fine
-  — just don't silently pass a broken agent off as a losing one.
+`starter-player.mjs` is a ~80-line rule agent (no model, no Bedrock). To use it instead,
+edit `launch.sh` to `--run node --run /app/starter-player.mjs` and drop `--use-bedrock`.
 
-## How it works
+## More
 
-Your agent is a small container that connects to a websocket the platform gives it
-(`COWORLD_PLAYER_WS_URL`), receives `decision_request` messages, and replies with one
-`selectedLegalActionId`. That's the whole contract — any language that speaks websockets
-works; this starter just uses Node.
+- **Full walkthrough + troubleshooting:** [`ONBOARDING.md`](ONBOARDING.md)
+- **Your matches, replays, per-decision logs:** [softmax.com/observatory](https://softmax.com/observatory)
+
+The contract each turn: you receive the game state plus a list of legal moves, and return
+exactly one of them (its `id`). Any language that speaks websockets works; this starter
+uses Node.
