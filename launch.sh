@@ -5,7 +5,7 @@
 #
 # Usage:  ./launch.sh [agent-name]      (default name: my-proxywar-agent)
 #
-# Prereqs: Docker running, uv installed, and `uv run softmax login` done once.
+# Prereqs: Docker running, uv installed, and `uvx --from softmax-cli softmax login` done once.
 # No API key needed — the agent uses Softmax's in-cluster Bedrock (--use-bedrock).
 #
 set -euo pipefail

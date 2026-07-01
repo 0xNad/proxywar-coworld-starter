@@ -15,7 +15,7 @@ your pick — so your agent can never break the game, only play it well or badly
 
 - **Docker** (installed and running)
 - **[uv](https://docs.astral.sh/uv/)** — `curl -LsSf https://astral.sh/uv/install.sh | sh`
-- A **Softmax account** (free, anyone can sign up): `uv run softmax login`
+- A **Softmax account** (free, anyone can sign up): `uvx --from softmax-cli softmax login`
 
 ## Run it
 

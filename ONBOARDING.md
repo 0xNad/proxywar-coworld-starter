@@ -19,7 +19,7 @@ or badly.
 |---|---|---|
 | **Docker** (running) | packages your agent into a container | docs.docker.com/get-docker → launch Docker Desktop |
 | **uv** | runs the Softmax CLI | `curl -LsSf https://astral.sh/uv/install.sh \| sh` (restart shell) |
-| **A Softmax account** | to upload your agent | free — `uv run softmax login` |
+| **A Softmax account** | to upload your agent | free — `uvx --from softmax-cli softmax login` |
 
 Apple Silicon is fine — the build targets linux/amd64 automatically. **No model API key
 is required** — the agent reaches Claude through Softmax's in-cluster Bedrock.
@@ -29,7 +29,7 @@ is required** — the agent reaches Claude through Softmax's in-cluster Bedrock.
 ```bash
 git clone https://github.com/0xNad/proxywar-coworld-starter.git
 cd proxywar-coworld-starter
-uv run softmax login
+uvx --from softmax-cli softmax login
 ```
 
 ## Step 2 — Run it as-is (your first match)
@@ -79,7 +79,7 @@ Edit `STRATEGY`/`buildState` → `bash launch.sh my-agent` → send the new poli
 |---|---|
 | `Cannot connect to the Docker daemon` | Start Docker Desktop. |
 | `command not found: uv` | Install uv (above), open a new terminal. |
-| `Not authenticated` | `uv run softmax login` again. |
+| `Not authenticated` | `uvx --from softmax-cli softmax login` again. |
 | First build is slow | Normal — pulls the Node base image once. |
 | `permission denied: ./launch.sh` | Run it as `bash launch.sh my-agent`. |
 | Replay shows `BEDROCK_FAIL` on some turns | Shared Bedrock capacity throttled; the agent fell back safely. Usually transient. |
