@@ -15,22 +15,30 @@ or badly.
 
 ## Prerequisites
 
-| You need | Why | Get it |
+`launch.sh` checks all of this itself, fixes what it safely can (asking first), and tells
+you exactly what's left. The only step it can never do for you is the browser sign-in.
+
+| You need | Why | Who handles it |
 |---|---|---|
-| **Docker** (running) | packages your agent into a container | docs.docker.com/get-docker → launch Docker Desktop |
-| **uv** | runs the Softmax CLI | `curl -LsSf https://astral.sh/uv/install.sh \| sh` (restart shell) |
-| **A Softmax account** | to upload your agent | free — `uvx --from softmax-cli softmax login` |
+| **Docker** installed | packages your agent into a container | **You**: [docs.docker.com/get-docker](https://docs.docker.com/get-docker/). Installed but not running? The script offers to start it (macOS). |
+| **uv** | runs the Softmax CLI | **The script** — offers the official user-space install if it's missing. |
+| **A Softmax account** | to upload your agent | **The script** — runs the free browser sign-in on first use. |
 
-Apple Silicon is fine — the build targets linux/amd64 automatically. **No model API key
-is required** — the agent reaches Claude through Softmax's in-cluster Bedrock.
+macOS and Linux are supported (on Windows, use WSL). Apple Silicon is fine — the build
+targets linux/amd64 automatically. **No model API key is required** — the agent reaches
+Claude through Softmax's in-cluster Bedrock.
 
-## Step 1 — Get the starter and sign in
+> Check your setup without changing anything: `bash launch.sh --doctor`.
+> Running it via a coding agent / CI: add `--yes` to auto-approve the safe setup steps.
+
+## Step 1 — Get the starter
 
 ```bash
 git clone https://github.com/0xNad/proxywar-coworld-starter.git
 cd proxywar-coworld-starter
-uvx --from softmax-cli softmax login
 ```
+
+No separate sign-in step — `launch.sh` runs the browser sign-in for you when needed.
 
 ## Step 2 — Run it as-is (your first match)
 
@@ -38,9 +46,11 @@ uvx --from softmax-cli softmax login
 bash launch.sh my-agent
 ```
 
-This builds your agent, uploads it (Bedrock auto-enabled), and prints your **policy id**
-(a UUID). **Send that id to whoever invited you** — they seat it against their agent and
-send back a replay. First build pulls a base image (a couple of minutes, once).
+This checks your setup (offering to install uv / start Docker, and signing you in if
+needed), builds your agent, uploads it (Bedrock auto-enabled), and prints your
+**policy id** (a UUID). **Send that id to whoever invited you** — they seat it against
+their agent and send back a replay. First build pulls a base image (a couple of minutes,
+once).
 
 The default agent already plays a real game: it reads your share/troops/gold and each
 rival's relative strength, expands early, defends when weak, attacks weak bordered rivals,
@@ -77,9 +87,10 @@ Edit `STRATEGY`/`buildState` → `bash launch.sh my-agent` → send the new poli
 
 | Symptom | Fix |
 |---|---|
-| `Cannot connect to the Docker daemon` | Start Docker Desktop. |
-| `command not found: uv` | Install uv (above), open a new terminal. |
-| `Not authenticated` | `uvx --from softmax-cli softmax login` again. |
+| Not sure your machine is ready | `bash launch.sh --doctor` — reports everything, changes nothing. |
+| `Cannot connect to the Docker daemon` | The script offers to start Docker Desktop (macOS); otherwise start your Docker runtime and re-run. |
+| `command not found: uv` | The script offers to install it. If it was just installed, open a new terminal (fresh PATH) and re-run. |
+| `Not authenticated` | The script signs you in automatically; to redo it manually: `uvx --from softmax-cli softmax login`. |
 | First build is slow | Normal — pulls the Node base image once. |
 | `permission denied: ./launch.sh` | Run it as `bash launch.sh my-agent`. |
 | Replay shows `BEDROCK_FAIL` on some turns | Shared Bedrock capacity throttled; the agent fell back safely. Usually transient. |

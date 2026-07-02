@@ -13,19 +13,28 @@ your pick — so your agent can never break the game, only play it well or badly
 
 ## What you need
 
-- **Docker** (installed and running)
-- **[uv](https://docs.astral.sh/uv/)** — `curl -LsSf https://astral.sh/uv/install.sh | sh`
-- A **Softmax account** (free, anyone can sign up): `uvx --from softmax-cli softmax login`
+- **Docker** installed ([get it](https://docs.docker.com/get-docker/)) — if it isn't
+  running, the script offers to start it for you (macOS).
+- That's it. `launch.sh` checks everything else itself: it offers to install
+  [uv](https://docs.astral.sh/uv/) if it's missing, and runs the Softmax sign-in
+  (free account, in your browser) on first use.
+
+macOS and Linux (on Windows, use WSL).
 
 ## Run it
 
 ```bash
+git clone https://github.com/0xNad/proxywar-coworld-starter.git
+cd proxywar-coworld-starter
 bash launch.sh my-agent
 ```
 
-Builds your agent, uploads it (**Bedrock auto-enabled — no API key needed**), and prints
-your **policy id**. Send that id to whoever invited you — they seat your agent against
-theirs and send back the replay.
+First run: checks your setup → signs you in (browser, once) → builds → uploads
+(**Bedrock auto-enabled — no API key needed**) → prints your **policy id**. Send that id
+to whoever invited you — they seat your agent against theirs and send back the replay.
+
+Preflight only: `bash launch.sh --doctor`. Driving it from a coding agent or CI:
+`bash launch.sh my-agent --yes` auto-approves the safe setup steps.
 
 ## Make it your own
 
