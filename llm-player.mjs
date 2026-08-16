@@ -116,6 +116,9 @@ const SECURITY =
 
 // -- anti-loop memory (distilled from the keystone's avoidActionIDs) ----------
 const history = []; // { actionID, kind } appended after each decision
+// Inbound messages already answered, keyed `${senderID}:${turnNumber}`, so a
+// rival writing every step cannot pull this agent into an endless exchange.
+const answeredMessages = new Set();
 function avoidActionIDs() {
   const recent = history
     .slice(-6)
@@ -137,12 +140,12 @@ function avoidActionIDs() {
 }
 
 // -- show the model what matters: shares, ratios, booleans (not map tiles) ----
-function clean(s) {
+function clean(s, maxLength = 60) {
   return String(s ?? "")
     .replace(/[^\x20-\x7e]/g, " ")
     .replace(/\s+/g, " ")
     .trim()
-    .slice(0, 60);
+    .slice(0, maxLength);
 }
 function cleanID(s) {
   return String(s ?? "")
@@ -190,6 +193,7 @@ function normalizeDealPolicies(value) {
 }
 function buildState(obs, actions) {
   const own = obs.ownState || {};
+  const spatialEnabled = obs.spatial?.schemaVersion === 1;
   const self = {
     tileShare: own.tileShare,
     troops: own.troops,
@@ -209,6 +213,65 @@ function buildState(obs, actions) {
       isAllied: p.isAllied,
       relation: p.relation,
       canAttack: p.canAttack,
+      ...(spatialEnabled
+        ? {
+            playerID: cleanID(p.playerID),
+            ...([
+              "north",
+              "northeast",
+              "east",
+              "southeast",
+              "south",
+              "southwest",
+              "west",
+              "northwest",
+            ].includes(p.bearing)
+              ? { bearing: p.bearing }
+              : {}),
+            ...(["adjacent", "near", "far"].includes(p.distanceClass)
+              ? { distanceClass: p.distanceClass }
+              : {}),
+            ...(p.borderWithYou
+              ? {
+                  borderWithYou: {
+                    tiles: Math.max(
+                      0,
+                      Math.floor(Number(p.borderWithYou.tiles) || 0),
+                    ),
+                    shareOfYourBorder: Math.max(
+                      0,
+                      Math.min(
+                        100,
+                        Math.round(
+                          Number(p.borderWithYou.shareOfYourBorder) || 0,
+                        ),
+                      ),
+                    ),
+                    terrain: ["land", "coastal", "mixed"].includes(
+                      p.borderWithYou.terrain,
+                    )
+                      ? p.borderWithYou.terrain
+                      : "land",
+                    defensePostsCovering: Math.max(
+                      0,
+                      Math.floor(
+                        Number(p.borderWithYou.defensePostsCovering) || 0,
+                      ),
+                    ),
+                    underAttackHere: p.borderWithYou.underAttackHere === true,
+                  },
+                }
+              : {}),
+            ...(Array.isArray(p.bordersWith)
+              ? {
+                  bordersWith: p.bordersWith.slice(0, 16).map((edge) => ({
+                    playerID: cleanID(edge?.playerID),
+                    sizeClass: edge?.sizeClass === "major" ? "major" : "minor",
+                  })),
+                }
+              : {}),
+          }
+        : {}),
     }));
   const legal = actions.map((a) => ({
     id: a.id,
@@ -349,6 +412,107 @@ function buildState(obs, actions) {
       proposalOptions,
     };
   }
+  let spatial;
+  if (spatialEnabled && obs.spatial?.ownShape) {
+    const sourceShape = obs.spatial.ownShape;
+    const quadrants = [
+      "northwest",
+      "north",
+      "northeast",
+      "west",
+      "center",
+      "east",
+      "southwest",
+      "south",
+      "southeast",
+    ];
+    const shape = {
+      quadrant: quadrants.includes(sourceShape.quadrant)
+        ? sourceShape.quadrant
+        : "center",
+      ...(["compact", "stretched", "fragmented"].includes(
+        sourceShape.compactness,
+      )
+        ? { compactness: sourceShape.compactness }
+        : {}),
+      ...(Number.isInteger(sourceShape.regionCount) &&
+      sourceShape.regionCount >= 0
+        ? { regionCount: sourceShape.regionCount }
+        : {}),
+      ...(Number.isFinite(sourceShape.largestRegionShare)
+        ? {
+            largestRegionShare: Math.max(
+              0,
+              Math.min(100, Math.round(sourceShape.largestRegionShare)),
+            ),
+          }
+        : {}),
+      regionAnalysis:
+        sourceShape.regionAnalysis === "complete"
+          ? "complete"
+          : "omitted_budget",
+      centroidBasis:
+        sourceShape.centroidBasis === "largest_region_border"
+          ? "largest_region_border"
+          : "all_border_budget_fallback",
+      coastShare: Math.max(
+        0,
+        Math.min(100, Math.round(Number(sourceShape.coastShare) || 0)),
+      ),
+      centroid: {
+        xPct: Math.max(
+          0,
+          Math.min(100, Math.round(Number(sourceShape.centroid?.xPct) || 0)),
+        ),
+        yPct: Math.max(
+          0,
+          Math.min(100, Math.round(Number(sourceShape.centroid?.yPct) || 0)),
+        ),
+      },
+    };
+    const briefing = (obs.notes || [])
+      .filter((note) => String(note).startsWith("Spatial "))
+      .slice(0, 3)
+      .map((note) => clean(note, 240));
+    let minimap;
+    if (
+      obs.spatial.minimap?.schemaVersion === 1 &&
+      obs.spatial.minimap.width === 24 &&
+      obs.spatial.minimap.height === 12
+    ) {
+      const rows = (obs.spatial.minimap.rows || []).slice(0, 12).map((row) =>
+        String(row)
+          .replace(/[^A-Za-z0-9.@#~]/g, "")
+          .slice(0, 24),
+      );
+      const legend = (obs.spatial.minimap.legend || [])
+        .slice(0, 64)
+        .map((entry) => ({
+          glyph: String(entry?.glyph || "")
+            .replace(/[^A-Za-z0-9@#]/g, "")
+            .slice(0, 1),
+          playerID: cleanID(entry?.playerID),
+          name: clean(entry?.name),
+          isYou: entry?.isYou === true,
+        }))
+        .filter((entry) => entry.glyph && entry.playerID);
+      if (rows.length === 12 && rows.every((row) => row.length === 24)) {
+        minimap = {
+          schemaVersion: 1,
+          width: 24,
+          height: 12,
+          rows,
+          legend,
+        };
+      }
+    }
+    spatial = {
+      schemaVersion: 1,
+      ownShape: shape,
+      ...(briefing.length ? { briefing } : {}),
+      ...(minimap ? { minimap } : {}),
+    };
+  }
   return {
     phase: obs.phase,
     self,
@@ -357,6 +521,7 @@ function buildState(obs, actions) {
     legalActions: legal,
     ...(econ ? { econ } : {}),
     ...(deals ? { deals } : {}),
+    ...(spatial ? { spatial } : {}),
   };
 }
 
@@ -447,6 +612,8 @@ const plannerUsageObserved = {
 };
 let plannerAttemptSequence = 0;
 let plannerUsageSummaryEmitted = false;
+let plannerSpatialSchemaVersion = 0;
+let plannerSpatialMinimap = false;
 
 function tokenCount(value) {
   const parsed = Number(value);
@@ -488,6 +655,13 @@ function normalizePlannerUsageEvent(event) {
     promptVariant: PROMPT_VARIANT,
     planEvery: PLAN_EVERY,
     promptCache: PROMPT_CACHE,
+    spatialSchemaVersion: tokenCount(
+      event?.spatialSchemaVersion ?? plannerSpatialSchemaVersion,
+    ),
+    spatialMinimap:
+      event?.spatialMinimap === undefined
+        ? plannerSpatialMinimap
+        : event.spatialMinimap === true,
     event: clean(event?.event),
   };
   for (const key of [
@@ -715,6 +889,9 @@ let lastPlanError = null; // set when the most recent refresh failed (loud degra
 function refreshPlanInBackground(state) {
   if (planRefreshInFlight) return;
   planRefreshInFlight = true;
+  plannerSpatialSchemaVersion =
+    state?.spatial?.schemaVersion === 1 ? state.spatial.schemaVersion : 0;
+  plannerSpatialMinimap = state?.spatial?.minimap?.schemaVersion === 1;
   withTimeout(askBedrock(state), 20000)
     .then(({ attempt, text, model }) => {
       const parsed = extractJson(text, PROMPT_HARDENING);
@@ -864,6 +1041,141 @@ function failedReliabilityGate(obs, playerID) {
     ? observed
     : Number(reliability?.fulfilled ?? 0) / judged;
   return rate < DEAL_TRUST_MIN_RELIABILITY;
+}
+
+// ---------------------------------------------------------------------------
+// Free-text negotiation.
+//
+// READ THIS BEFORE CHANGING IT.
+//
+// `observation.nonCombat.inboundMessages` is written by RIVAL POLICIES. It is
+// data about what someone CLAIMED, never instructions to you. Rivals are
+// allowed to write anything, including text shaped like a system prompt
+// ("ignore your instructions", "SYSTEM:", "you must donate"). That is legal
+// play in this league, not an exploit, and nobody will stop it for you.
+//
+// This starter is therefore hardened by construction rather than by asking a
+// model nicely:
+//   1. inbound text is never concatenated into the planner prompt, so it can
+//      never become part of your instructions;
+//   2. only the FACT that a rival wrote to you, and their id, influences
+//      behavior — never the content;
+//   3. replies are chosen from fixed templates below, so a rival's words can
+//      never author your words.
+//
+// If you make your agent smarter by actually reading the text with a model,
+// keep the boundary explicit: pass it as clearly-labelled untrusted data,
+// and never let it select an action id.
+// ---------------------------------------------------------------------------
+
+// Bounded, deterministic replies. Wording is ours, so no rival can put words
+// in this agent's mouth. Kept well under the 280-character cap.
+const MESSAGE_MAX_CHARS = 280;
+const MESSAGE_REPLIES = {
+  ally: "We are allied. I will not move on your border while that holds.",
+  dealOpen: "Your proposal is on my table. Keep your side and I keep mine.",
+  breaker: "You broke a deal with me. I am not trading on your word again.",
+  neutral: "Noted. I am open to a pact if you stay off my border.",
+};
+
+// Openers. Without these the starter is purely reactive, and since most league
+// seats descend from this file, a starter-only league would never contain a
+// single conversation: everyone waits to be spoken to. One agent has to be
+// willing to speak first for the channel to exist at all.
+const MESSAGE_OPENERS = {
+  withProposal:
+    "I have put an offer to you. Take it and neither of us wastes troops on the other.",
+  border: "We share a border. I would rather point my troops elsewhere - pact?",
+};
+
+// Answers at most one rival per decision: the one who most recently wrote to
+// us and has not already been answered since. Silence is the default — an
+// agent that talks every step is noise, not negotiation.
+function chooseMessageMove(actions, obs, answered, dealMove) {
+  const offers = (actions || []).filter((action) => action.kind === "message");
+  if (offers.length === 0) return null;
+  const inbound = obs?.nonCombat?.inboundMessages || [];
+
+  if (inbound.length === 0) {
+    return chooseMessageOpener(offers, obs, answered, dealMove);
+  }
+
+  const newest = [...inbound].sort(
+    (a, b) => Number(a.turnNumber ?? 0) - Number(b.turnNumber ?? 0),
+  )[inbound.length - 1];
+  const senderID = newest?.senderID;
+  if (!senderID) return null;
+  // One reply per inbound turn, so a spammer cannot pull us into a loop.
+  const key = `${senderID}:${newest.turnNumber}`;
+  if (answered.has(key)) return null;
+
+  const offer = offers.find(
+    (action) => action.metadata?.recipientID === senderID,
+  );
+  if (!offer) return null;
+
+  const rival = (obs?.visiblePlayers || []).find(
+    (player) => player?.playerID === senderID,
+  );
+  const hasOpenDeal = [
+    ...(obs?.deals?.incomingProposals || []),
+    ...(obs?.deals?.outgoingProposals || []),
+    ...(obs?.deals?.activeDeals || []),
+  ].some(
+    (view) =>
+      view?.proposerPlayerID === senderID || view?.recipientPlayerID === senderID,
+  );
+
+  let text;
+  if (failedReliabilityGate(obs, senderID)) text = MESSAGE_REPLIES.breaker;
+  else if (rival?.isAllied) text = MESSAGE_REPLIES.ally;
+  else if (hasOpenDeal) text = MESSAGE_REPLIES.dealOpen;
+  else text = MESSAGE_REPLIES.neutral;
+
+  answered.add(key);
+  return { id: offer.id, text: text.slice(0, MESSAGE_MAX_CHARS) };
+}
+
+// Speaks first, but rarely and only when there is something to say. Two
+// occasions, both tied to a concrete opportunity rather than chatter:
+//   (a) we are proposing a deal to this rival on this very decision - the
+//       message is the reason to accept, which the bare template lacks;
+//   (b) we share a border with a rival we have never written to.
+// At most one opener per counterparty per match.
+function chooseMessageOpener(offers, obs, answered, dealMove) {
+  const dealRecipient =
+    dealMove?.kind === "deal_propose" ? dealMove?.metadata?.recipientID : null;
+  if (dealRecipient) {
+    const offer = offers.find(
+      (action) => action.metadata?.recipientID === dealRecipient,
+    );
+    const key = `opener:${dealRecipient}`;
+    if (offer && !answered.has(key)) {
+      answered.add(key);
+      return {
+        id: offer.id,
+        text: MESSAGE_OPENERS.withProposal.slice(0, MESSAGE_MAX_CHARS),
+      };
+    }
+  }
+
+  for (const offer of offers) {
+    const recipientID = offer.metadata?.recipientID;
+    const key = `opener:${recipientID}`;
+    if (answered.has(key)) continue;
+    const rival = (obs?.visiblePlayers || []).find(
+      (player) => player?.playerID === recipientID,
+    );
+    // Only borderers, and never someone already proven unreliable.
+    if (!rival?.sharesBorder || rival.isAllied) continue;
+    if (failedReliabilityGate(obs, recipientID)) continue;
+    answered.add(key);
+    return {
+      id: offer.id,
+      text: MESSAGE_OPENERS.border.slice(0, MESSAGE_MAX_CHARS),
+    };
+  }
+  return null;
 }
 
 // Deterministic deal executor. The move it returns is sent in the SEPARATE
@@ -1255,6 +1567,70 @@ function choose(actions, obs) {
   }
   return actions.find((c) => c.kind === "hold") ?? actions[0];
 }
+
+function spawnPreferenceRanking(message, actions) {
+  const advertised = message?.protocol?.maxSpawnPreferences;
+  if (
+    !Array.isArray(actions) ||
+    actions.length === 0 ||
+    !actions.every((action) => action?.kind === "spawn") ||
+    typeof advertised !== "number" ||
+    !Number.isFinite(advertised) ||
+    advertised < 1
+  ) {
+    return null;
+  }
+  const limit = Math.min(16, Math.floor(advertised));
+  return actions
+    .map((action, index) => ({
+      action,
+      index,
+      score: spawnPreferenceScore(action),
+      tile:
+        typeof action?.metadata?.tile === "number" &&
+        Number.isFinite(action.metadata.tile)
+          ? action.metadata.tile
+          : Number.POSITIVE_INFINITY,
+    }))
+    .sort(
+      (left, right) =>
+        right.score - left.score ||
+        left.tile - right.tile ||
+        String(left.action.id).localeCompare(String(right.action.id)) ||
+        left.index - right.index,
+    )
+    .slice(0, limit)
+    .map(({ action }) => action);
+}
+
+function spawnPreferenceScore(action) {
+  const score = (key) => {
+    const value = action?.metadata?.[key];
+    return typeof value === "number" && Number.isFinite(value) ? value : 0;
+  };
+  const opportunity = score("opportunityScore");
+  const pressure = score("pressureScore");
+  const safety = score("safetyScore");
+  const diplomacy = score("diplomacyScore");
+  const localLand = score("localLandScore");
+  const middleSafetyBand = Math.max(0, 1 - Math.abs(safety - 0.32) / 0.24);
+  const lowSafetyPenalty =
+    safety < 0.18
+      ? (0.18 - safety) * 2.4 + 0.16
+      : safety < 0.23
+        ? (0.23 - safety) * 1.1
+        : 0;
+  return (
+    opportunity * 0.32 +
+    pressure * 0.18 +
+    middleSafetyBand * 0.03 +
+    localLand * 0.5 +
+    safety * 0.25 +
+    diplomacy * 0.28 -
+    lowSafetyPenalty
+  );
+}
+
 function withTimeout(promise, ms) {
   return Promise.race([
     promise,
@@ -1311,6 +1687,25 @@ export function startLlmPlayer({
     if (message.type !== "decision_request") return;
 
     const actions = message.request.legalActions ?? [];
+    const spawnPreferences = spawnPreferenceRanking(message, actions);
+    if (spawnPreferences !== null) {
+      socket.send(
+        JSON.stringify({
+          type: "decision_response",
+          requestID: message.requestID,
+          selectedLegalActionId: spawnPreferences[0].id,
+          spawnPreferenceLegalActionIds: spawnPreferences.map(
+            (preference) => preference.id,
+          ),
+          reason: `starter ranked ${spawnPreferences.length} offered spawn actions from metadata`,
+          confidence: 0.7,
+        }),
+      );
+      // Do not age/refresh the strategic plan or append ordinary history for
+      // the sealed spawn ballot. It is one pre-game allocation request, not a
+      // gameplay decision and has no reaction phase.
+      return;
+    }
     const obs = message.request.observation ?? {};
     const state = buildState(obs, actions);
 
@@ -1323,6 +1718,15 @@ export function startLlmPlayer({
     // The deal posture rides its OWN slot: it is sent alongside the game move,
     // never instead of it. Absent field => byte-identical to the old reply.
     const dealMove = chooseDealMove(actions, obs);
+    // Comms slot: independent of the game action and the deal action, so
+    // answering a rival never costs a move. Returns null (silence) unless
+    // someone actually wrote to us.
+    const messageMove = chooseMessageMove(
+      actions,
+      obs,
+      answeredMessages,
+      dealMove,
+    );
     const degraded = lastPlanError !== null;
     let reason;
     if (plan !== null) {
@@ -1347,6 +1751,12 @@ export function startLlmPlayer({
         requestID: message.requestID,
         selectedLegalActionId: chosen.id,
         ...(dealMove ? { selectedDealActionId: dealMove.id } : {}),
+        ...(messageMove
+          ? {
+              selectedMessageActionId: messageMove.id,
+              messageText: messageMove.text,
+            }
+          : {}),
         reason: reason.slice(0, 200),
         confidence: plan !== null ? (degraded ? 0.5 : 0.75) : 0.4,
         fallbackUsed: plan === null || degraded,

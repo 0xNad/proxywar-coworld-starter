@@ -30,16 +30,30 @@ socket.on("message", (data) => {
   if (message.type !== "decision_request") return;
 
   const legalActions = message.request.legalActions ?? [];
-  const action = chooseAction(legalActions, message.request.observation ?? {});
-  const dealAction = chooseDealAction(legalActions);
+  const spawnPreferences = spawnPreferenceRanking(message, legalActions);
+  const action =
+    spawnPreferences?.[0] ??
+    chooseAction(legalActions, message.request.observation ?? {});
+  const dealAction =
+    spawnPreferences === null ? chooseDealAction(legalActions) : null;
 
   socket.send(
     JSON.stringify({
       type: "decision_response",
       requestID: message.requestID,
       selectedLegalActionId: action.id,
+      ...(spawnPreferences !== null
+        ? {
+            spawnPreferenceLegalActionIds: spawnPreferences.map(
+              (preference) => preference.id,
+            ),
+          }
+        : {}),
       ...(dealAction !== null ? { selectedDealActionId: dealAction.id } : {}),
-      reason: `starter ${action.kind}: ${action.label}`,
+      reason:
+        spawnPreferences !== null
+          ? `starter ranked ${spawnPreferences.length} offered spawn actions from metadata`
+          : `starter ${action.kind}: ${action.label}`,
       confidence: action.kind === "hold" ? 0.45 : 0.72,
     }),
   );
@@ -136,6 +150,69 @@ function chooseAction(actions, obs) {
   );
 }
 
+function spawnPreferenceRanking(message, actions) {
+  const advertised = message?.protocol?.maxSpawnPreferences;
+  if (
+    !Array.isArray(actions) ||
+    actions.length === 0 ||
+    !actions.every((action) => action?.kind === "spawn") ||
+    typeof advertised !== "number" ||
+    !Number.isFinite(advertised) ||
+    advertised < 1
+  ) {
+    return null;
+  }
+  const limit = Math.min(16, Math.floor(advertised));
+  return actions
+    .map((action, index) => ({
+      action,
+      index,
+      score: spawnPreferenceScore(action),
+      tile:
+        typeof action?.metadata?.tile === "number" &&
+        Number.isFinite(action.metadata.tile)
+          ? action.metadata.tile
+          : Number.POSITIVE_INFINITY,
+    }))
+    .sort(
+      (left, right) =>
+        right.score - left.score ||
+        left.tile - right.tile ||
+        String(left.action.id).localeCompare(String(right.action.id)) ||
+        left.index - right.index,
+    )
+    .slice(0, limit)
+    .map(({ action }) => action);
+}
+
+function spawnPreferenceScore(action) {
+  const score = (key) => {
+    const value = action?.metadata?.[key];
+    return typeof value === "number" && Number.isFinite(value) ? value : 0;
+  };
+  const opportunity = score("opportunityScore");
+  const pressure = score("pressureScore");
+  const safety = score("safetyScore");
+  const diplomacy = score("diplomacyScore");
+  const localLand = score("localLandScore");
+  const middleSafetyBand = Math.max(0, 1 - Math.abs(safety - 0.32) / 0.24);
+  const lowSafetyPenalty =
+    safety < 0.18
+      ? (0.18 - safety) * 2.4 + 0.16
+      : safety < 0.23
+        ? (0.23 - safety) * 1.1
+        : 0;
+  return (
+    opportunity * 0.32 +
+    pressure * 0.18 +
+    middleSafetyBand * 0.03 +
+    localLand * 0.5 +
+    safety * 0.25 +
+    diplomacy * 0.28 -
+    lowSafetyPenalty
+  );
+}
+
 // The no-LLM starter keeps accepted non-aggression/trade-security promises by
 // default. Deals never make a hostile action illegal; this is policy posture,
 // not a second validator. Builders who want deliberate defection can replace
@@ -193,7 +270,19 @@ function wouldBreakPromise(action, constraints) {
 // omits this field remains compatible but ignores the opportunity.
 // Deterministic, bounded posture: accept only promises this minimal policy can
 // keep automatically (non-aggression / trade security), reject unsupported
-// commitments, propose only a non-aggression pact, and withdraw last.
+// commitments, and propose only a non-aggression pact.
+//
+// Do NOT give this chain a `?? deal_withdraw` tail. An offer stays answerable
+// for 4 decision steps, but a proposer may only open one every 3, and while a
+// pair already holds an open deal the manager offers no deal_propose for it —
+// so on the step right after proposing there is often nothing left to match
+// except deal_withdraw. A terminal withdraw therefore retracts the offer one
+// step after making it, before the recipient has answered even once. Measured
+// across 96 hosted league matches: 2,870 of 5,256 proposals (54.6%) were
+// withdrawn, 96.4% of them at exactly +1 step, cutting the recipient's four
+// chances to answer down to one. Withdrawing is de-escalation and needs a
+// reason, not an idle slot; returning null is correct, and the protocol treats
+// `selectedDealActionId` as optional.
 const DEAL_ACTION_KINDS = [
   "deal_accept",
   "deal_reject",
@@ -221,7 +310,6 @@ function chooseDealAction(actions) {
         candidate.kind === "deal_propose" &&
         candidate.metadata?.template === "non_aggression_pact",
     ) ??
-    actions.find((candidate) => candidate.kind === "deal_withdraw") ??
     null
   );
 }
