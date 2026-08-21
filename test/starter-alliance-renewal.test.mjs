@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
+import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -32,6 +33,68 @@ const api = new Function(
     "return { chooseAction, pendingRenewalAction, preferReciprocalAlliance };",
   ].join("\n"),
 )();
+
+function bootStarter() {
+  class FakeWebSocket {
+    static latest = null;
+
+    constructor(url) {
+      this.url = url;
+      this.handlers = new Map();
+      this.sent = [];
+      FakeWebSocket.latest = this;
+    }
+
+    on(event, handler) {
+      this.handlers.set(event, handler);
+    }
+
+    send(payload) {
+      this.sent.push(JSON.parse(String(payload)));
+    }
+
+    close() {}
+
+    emit(event, payload) {
+      const handler = this.handlers.get(event);
+      assert.ok(handler, `no ${event} handler registered`);
+      handler(payload);
+    }
+  }
+
+  const runtimeSource = source.replace('import { WebSocket } from "ws";', '');
+  vm.runInNewContext(
+    runtimeSource,
+    {
+      WebSocket: FakeWebSocket,
+      process: {
+        env: { COWORLD_PLAYER_WS_URL: "ws://match.test" },
+        on() {},
+        exit(code) {
+          throw new Error(`unexpected process.exit(${code})`);
+        },
+      },
+      console,
+      setTimeout,
+    },
+    { filename: "starter-player.mjs" },
+  );
+  assert.ok(FakeWebSocket.latest, "starter did not create its WebSocket");
+  return FakeWebSocket.latest;
+}
+
+function request(socket, requestID, legalActions, obs) {
+  socket.emit(
+    "message",
+    JSON.stringify({
+      type: "decision_request",
+      requestID,
+      request: { legalActions, observation: obs },
+    }),
+  );
+  assert.equal(socket.sent.length, 1);
+  return socket.sent[0];
+}
 
 const ATTACK = {
   id: "attack:P_FOE",
@@ -178,4 +241,30 @@ test("entry point completes the mutual alliance handshake", () => {
     api.chooseAction([STRANGER, ASKED, HOLD], observation()).id,
     STRANGER.id,
   );
+});
+
+test("wire handler sends the reciprocal alliance action id", () => {
+  const socket = bootStarter();
+  const response = request(
+    socket,
+    "req-handshake",
+    [STRANGER, ASKED, HOLD],
+    observation({ incomingFrom: "P_ASKED" }),
+  );
+  assert.equal(response.type, "decision_response");
+  assert.equal(response.requestID, "req-handshake");
+  assert.equal(response.selectedLegalActionId, ASKED.id);
+});
+
+test("wire handler sends the pending renewal action id", () => {
+  const socket = bootStarter();
+  const response = request(
+    socket,
+    "req-renewal",
+    [ATTACK, EXTEND, HOLD],
+    observation({ renewalRequested: true }),
+  );
+  assert.equal(response.type, "decision_response");
+  assert.equal(response.requestID, "req-renewal");
+  assert.equal(response.selectedLegalActionId, EXTEND.id);
 });
