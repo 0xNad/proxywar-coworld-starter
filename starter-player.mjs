@@ -106,24 +106,66 @@ socket.on("error", (error) => {
  *  high-risk moves, and holding if nothing better is offered. Replace it with
  *  whatever logic (or LLM call) you like — just always return a valid action.
  * ──────────────────────────────────────────────────────────────────────────── */
+// Alliance acceptance is a returning request: there is no alliance_accept
+// action. When this starter has already decided to ask for an alliance, aim
+// that request at the rival who asked us first so the mutual handshake can
+// actually complete. This changes targeting, not alliance appetite.
+function preferReciprocalAlliance(actions, obs, kind) {
+  if (kind !== "alliance_request") return null;
+  const rivals = obs?.visiblePlayers || [];
+  for (const action of actions || []) {
+    if (action?.kind !== "alliance_request") continue;
+    const targetID =
+      action.metadata?.targetID ??
+      action.metadata?.recipientID ??
+      action.metadata?.playerID;
+    const rival = rivals.find((player) => player?.playerID === targetID);
+    if (rival?.hasIncomingAllianceRequest === true) return action;
+  }
+  return null;
+}
+
+// Alliance renewal is mutual and one-shot. An ally that has already asked us
+// to extend is waiting inside a short renewal window, so reciprocating must
+// pre-empt the ordinary attack/build priority.
+function pendingRenewalAction(actions, obs) {
+  const rivals = obs?.visiblePlayers || [];
+  for (const action of actions || []) {
+    if (action?.kind !== "alliance_extend") continue;
+    const targetID =
+      action.metadata?.targetID ??
+      action.metadata?.recipientID ??
+      action.metadata?.playerID;
+    const rival = rivals.find((player) => player?.playerID === targetID);
+    if (rival?.allianceOtherAgreedToExtend === true) return action;
+  }
+  return null;
+}
+
 function chooseAction(actions, obs) {
   if (!Array.isArray(actions) || actions.length === 0) {
     throw new Error("decision_request had no legalActions");
   }
 
   const promiseConstraints = activePromiseConstraints(obs);
+  const renewal = pendingRenewalAction(actions, obs);
+  if (renewal) return renewal;
+
   const preferredKinds = [
     "spawn",
     "attack",
     "build",
     "upgrade_structure",
     "boat",
+    "alliance_extend",
     "alliance_request",
     "quick_chat",
     "emoji",
   ];
 
   for (const kind of preferredKinds) {
+    const reciprocal = preferReciprocalAlliance(actions, obs, kind);
+    if (reciprocal) return reciprocal;
     const action = actions.find(
       (candidate) =>
         candidate.kind === kind &&
