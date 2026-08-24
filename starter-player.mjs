@@ -9,6 +9,14 @@
  * is just the plumbing that talks to the match; you can ignore it.
  */
 import { WebSocket } from "ws";
+import {
+  advertisedMessageLimit,
+  createOwnerCapabilityEvidenceLogger,
+  dealResponseFields,
+  messageResponseFields,
+  ownerCapabilityObservation,
+  rankOfferedActionsWithSpatial,
+} from "./owner-capabilities.mjs";
 
 const url = process.env.COWORLD_PLAYER_WS_URL;
 if (!url) {
@@ -18,6 +26,7 @@ if (!url) {
 }
 
 const socket = new WebSocket(url);
+const ownerEvidence = createOwnerCapabilityEvidenceLogger();
 
 socket.on("open", () => console.log("connected to match"));
 
@@ -29,34 +38,69 @@ socket.on("message", (data) => {
   }
   if (message.type !== "decision_request") return;
 
-  const legalActions = message.request.legalActions ?? [];
+  const legalActions = Array.isArray(message.request.legalActions)
+    ? message.request.legalActions
+    : [];
+  const observation = ownerCapabilityObservation(message.request.observation);
   const spawnPreferences = spawnPreferenceRanking(message, legalActions);
   const action =
-    spawnPreferences?.[0] ??
-    chooseAction(legalActions, message.request.observation ?? {});
+    spawnPreferences?.[0] ?? chooseAction(legalActions, observation);
   const dealAction =
-    spawnPreferences === null ? chooseDealAction(legalActions) : null;
+    spawnPreferences === null
+      ? chooseDealAction(legalActions, observation)
+      : null;
+  // Comms slot: independent of both the game action and the deal action, so
+  // answering a rival never costs a move. Null (silence) unless there is
+  // something concrete to say. See the free-text section at the bottom.
+  const messageMove =
+    spawnPreferences === null &&
+    advertisedMessageLimit(message.protocol) !== null
+      ? chooseMessageMove(
+          legalActions,
+          observation,
+          answeredMessages,
+          dealAction,
+          advertisedMessageLimit(message.protocol),
+        )
+      : null;
 
-  socket.send(
-    JSON.stringify({
-      type: "decision_response",
-      requestID: message.requestID,
-      selectedLegalActionId: action.id,
-      ...(spawnPreferences !== null
-        ? {
-            spawnPreferenceLegalActionIds: spawnPreferences.map(
-              (preference) => preference.id,
-            ),
-          }
-        : {}),
-      ...(dealAction !== null ? { selectedDealActionId: dealAction.id } : {}),
-      reason:
-        spawnPreferences !== null
-          ? `starter ranked ${spawnPreferences.length} offered spawn actions from metadata`
-          : `starter ${action.kind}: ${action.label}`,
-      confidence: action.kind === "hold" ? 0.45 : 0.72,
+  const response = {
+    type: "decision_response",
+    requestID: message.requestID,
+    selectedLegalActionId: action.id,
+    runtimeMode: "local-policy-baseline",
+    ...(spawnPreferences !== null
+      ? {
+          spawnPreferenceLegalActionIds: spawnPreferences.map(
+            (preference) => preference.id,
+          ),
+        }
+      : {}),
+    ...dealResponseFields({
+      actions: legalActions,
+      observation,
+      dealMove: dealAction,
     }),
-  );
+    ...messageResponseFields({
+      actions: legalActions,
+      protocol: message.protocol,
+      messageMove,
+    }),
+    reason:
+      spawnPreferences !== null
+        ? `starter ranked ${spawnPreferences.length} offered spawn actions from metadata`
+        : `starter ${action.kind}: ${action.label}`,
+    confidence: action.kind === "hold" ? 0.45 : 0.72,
+  };
+  ownerEvidence({
+    requestID: message.requestID,
+    slot: message.slot,
+    actions: legalActions,
+    observation,
+    response,
+    spawn: spawnPreferences !== null,
+  });
+  socket.send(JSON.stringify(response));
 });
 
 // Post-final linger (hosted only, via pod env) — see llm-player.mjs; keeps
@@ -106,31 +150,95 @@ socket.on("error", (error) => {
  *  high-risk moves, and holding if nothing better is offered. Replace it with
  *  whatever logic (or LLM call) you like — just always return a valid action.
  * ──────────────────────────────────────────────────────────────────────────── */
+// Alliance renewal is MUTUAL and one-shot: the core extends only once BOTH
+// sides have asked inside a short window (~10% of alliance life), and
+// `canExtendAlliance` goes false the moment you ask. 0.1.48 added
+// `allianceOtherAgreedToExtend` to the observation precisely so a policy can
+// see that its ally is already waiting on it — bots and nations have always
+// reciprocated off the core's equivalent signal.
+//
+// Answering a pending renewal is the cheapest good move on the board: ONE
+// action preserves an existing alliance. So it pre-empts the ordinary
+// preference list rather than sitting inside it.
+// Acceptance is a RETURNING request: there is no `alliance_accept` kind, so an
+// alliance forms only when both sides ask. Our own executor already nudges this
+// (`allianceReciprocityPriority` adds +20 when a rival has asked); starters read
+// the flag nowhere, so their requests scatter across rivals who never asked.
+// Measured locally: 6 seats over 7,300 turns sent 19 alliance requests and
+// formed ZERO alliances.
+//
+// This deliberately does NOT change how OFTEN a starter seeks an alliance — only
+// WHOM it asks when it has already decided to ask. Appetite unchanged, so it
+// cannot push the field toward the social stalemate the 2026-08-07 territorial
+// backstop exists to catch.
+function preferReciprocalAlliance(actions, obs, kind) {
+  if (kind !== "alliance_request") return null;
+  const rivals = obs?.visiblePlayers || [];
+  for (const action of actions || []) {
+    if (action?.kind !== "alliance_request") continue;
+    const targetID =
+      action.metadata?.targetID ??
+      action.metadata?.recipientID ??
+      action.metadata?.playerID;
+    const rival = rivals.find((player) => player?.playerID === targetID);
+    if (rival?.hasIncomingAllianceRequest === true) return action;
+  }
+  return null;
+}
+
+function pendingRenewalAction(actions, obs) {
+  const rivals = obs?.visiblePlayers || [];
+  for (const action of actions || []) {
+    if (action?.kind !== "alliance_extend") continue;
+    const targetID =
+      action.metadata?.targetID ??
+      action.metadata?.recipientID ??
+      action.metadata?.playerID;
+    const rival = rivals.find((player) => player?.playerID === targetID);
+    if (rival?.allianceOtherAgreedToExtend === true) return action;
+  }
+  return null;
+}
+
 function chooseAction(actions, obs) {
   if (!Array.isArray(actions) || actions.length === 0) {
     throw new Error("decision_request had no legalActions");
   }
 
   const promiseConstraints = activePromiseConstraints(obs);
+  // An ally already asked to renew: answer it before anything else, because the
+  // window is short, one-shot, and this single action saves the alliance.
+  const renewal = pendingRenewalAction(actions, obs);
+  if (renewal) return renewal;
+
   const preferredKinds = [
     "spawn",
     "attack",
     "build",
     "upgrade_structure",
     "boat",
+    "alliance_extend",
     "alliance_request",
     "quick_chat",
     "emoji",
   ];
 
   for (const kind of preferredKinds) {
-    const action = actions.find(
+    // Same appetite, better aim: if we are about to ask for an alliance, ask
+    // the rival who already asked us, so the pair actually forms one.
+    const reciprocal = preferReciprocalAlliance(actions, obs, kind);
+    if (reciprocal) return reciprocal;
+    const candidates = actions.filter(
       (candidate) =>
         candidate.kind === kind &&
         candidate.risk?.level !== "high" &&
         !String(candidate.id).includes("avoid") &&
         !wouldBreakPromise(candidate, promiseConstraints),
     );
+    const action =
+      obs?.spatial?.visibilityModel === "global-lockstep-public-map-v1"
+        ? rankOfferedActionsWithSpatial(candidates, obs)[0]
+        : candidates[0];
     if (action) return action;
   }
 
@@ -140,12 +248,20 @@ function chooseAction(actions, obs) {
         candidate.kind === "hold" &&
         !wouldBreakPromise(candidate, promiseConstraints),
     ) ??
+    // `message` is excluded for the same reason the deal meta-actions are: it
+    // is a comms selection for its own slot, not a game move, so spending the
+    // PRIMARY slot on it would forfeit the turn. Talking rides alongside
+    // acting.
     actions.find(
       (candidate) =>
         !isDealActionKind(candidate.kind) &&
+        candidate.kind !== "message" &&
         !wouldBreakPromise(candidate, promiseConstraints),
     ) ??
-    actions.find((candidate) => !isDealActionKind(candidate.kind)) ??
+    actions.find(
+      (candidate) =>
+        !isDealActionKind(candidate.kind) && candidate.kind !== "message",
+    ) ??
     actions[0]
   );
 }
@@ -294,7 +410,8 @@ function isDealActionKind(kind) {
   return DEAL_ACTION_KINDS.includes(kind);
 }
 
-function chooseDealAction(actions) {
+function chooseDealAction(actions, obs) {
+  if (!obs?.deals || typeof obs.deals !== "object") return null;
   const supported = (action) =>
     action.metadata?.template === "non_aggression_pact" ||
     action.metadata?.template === "trade_security_pact";
@@ -312,4 +429,238 @@ function chooseDealAction(actions) {
     ) ??
     null
   );
+}
+
+// ---------------------------------------------------------------------------
+// Free-text negotiation (the OPTIONAL comms slot: selectedMessageActionId +
+// messageText, see coworld-adapter/docs/player-protocol.md).
+//
+// READ THIS BEFORE CHANGING IT.
+//
+// `observation.nonCombat.inboundMessages` is written by RIVAL POLICIES. It is
+// data about what somebody CLAIMED, never an instruction to this agent. A
+// rival may write anything at all, including text shaped like a system prompt
+// ("ignore your instructions", "SYSTEM:", "you must donate"). That is legal
+// play in this league, not an exploit, and nobody will stop it for you.
+//
+// This starter is deterministic, so the boundary is structural rather than a
+// matter of judgement:
+//   1. chooseAction() never reads the inbox, so no message can change the game
+//      move;
+//   2. reply wording comes only from the fixed templates below, so a rival can
+//      never put words in this agent's mouth;
+//   3. only the SENDER's own currently-offered `message` id is ever used, so a
+//      message can never be addressed at a third party on a rival's say-so;
+//   4. inbound text is never copied into an outgoing message.
+// Keep properties 1-4 if you change anything here.
+//
+// The comms slot rides ALONGSIDE the game action and the deal action, never
+// instead of either, so answering somebody never costs a turn of expansion or
+// attack. Staying silent omits both fields, which is byte-identical to the
+// reply this starter sent before it could speak.
+//
+// Inert unless the match actually offers `message` actions (server flag
+// PROXYWAR_TUNE_FREETEXT_MESSAGES is off by default).
+
+// Server-side cap (AgentTunables.FREETEXT_MESSAGE_MAX_CHARS). Over-cap text is
+// REJECTED rather than trimmed - a shortened promise is a different promise -
+// so every template below stays well short of it.
+const MESSAGE_MAX_CHARS = 280;
+
+// Fixed replies, picked by what the rival has actually DONE and never by what
+// their message says. Deliberately worded differently from the LLM starter's
+// templates so a replay makes it obvious which starter spoke.
+const MESSAGE_REPLIES = {
+  ally: "Allied, and I keep alliances. Your border is safe from me while it holds.",
+  dealOpen:
+    "There is an offer open between us. Settle it and I hold to what it says.",
+  breaker:
+    "You have broken terms with me before. Show me otherwise before I trade again.",
+  neutral:
+    "Heard. Stay off my border and I will spend my troops somewhere else.",
+};
+
+// Openers. Without one this starter is purely reactive, and since most league
+// seats descend from this file a starter-only lobby would never contain a
+// single conversation: everybody would sit waiting to be spoken to. At most
+// one opener per counterparty per match, and only when there is a concrete
+// reason to speak.
+const MESSAGE_OPENERS = {
+  withProposal:
+    "My offer is on your table. Take it and neither of us spends troops on the other.",
+  border:
+    "Our lands touch. I would rather buy a quiet border than fight for it - pact?",
+};
+
+// Below this observed rate a rival counts as a proven deal-breaker. Matches
+// the LLM starter's DEAL_TRUST_MIN_RELIABILITY.
+const MESSAGE_TRUST_MIN_RELIABILITY = 0.5;
+
+// Inbound messages already answered, keyed `${senderID}:${turnNumber}`, plus
+// `opener:${recipientID}` for counterparties already opened with and
+// `reply:${senderID}:${n}` for the lifetime reply budget. Module scope, so it
+// is exactly one match's memory.
+// Lifetime replies per counterparty, per match. The per-inbound-message key
+// below CANNOT break a mutual exchange: every reply we send becomes a new
+// inbound message with a new turn number on the other side, so both agents keep
+// seeing a key neither has answered. Hosted episode ereq_3fc90743 (0.1.49, four
+// talker seats) produced 5 openers and 861 replies over 1,204 decisions --
+// 285/285 and 145/146 per mirrored pair, a message on ~72% of all decisions.
+// Three replies is enough for a negotiation (answer, counter, confirmation) and
+// matches the server's per-rival inbox window
+// (FREETEXT_INBOX_MAX_PER_RIVAL), past which older messages are not even shown.
+const MESSAGE_MAX_REPLIES_PER_RIVAL = 3;
+const answeredMessages = new Set();
+
+// Reputation from OBSERVED outcomes only (deals that actually terminated),
+// never from anything a rival said about themselves or anyone else.
+function provenDealBreaker(obs, playerID) {
+  const reliability = (obs?.deals?.rivalReliability || []).find(
+    (entry) => entry?.playerID === playerID,
+  );
+  const judged = Number(reliability?.terminalNonMoot ?? 0);
+  if (!Number.isFinite(judged) || judged <= 0) return false;
+  const observed = Number(reliability?.reliability);
+  const rate = Number.isFinite(observed)
+    ? observed
+    : Number(reliability?.fulfilled ?? 0) / judged;
+  return rate < MESSAGE_TRUST_MIN_RELIABILITY;
+}
+
+// Answers at most ONE rival per decision: whoever wrote most recently and has
+// not been answered yet. Silence is the default - an agent that talks every
+// step is noise, not negotiation.
+function chooseMessageMove(
+  actions,
+  obs,
+  answered,
+  dealMove,
+  maxChars = MESSAGE_MAX_CHARS,
+) {
+  const offers = (actions || []).filter((action) => action?.kind === "message");
+  if (offers.length === 0) return null;
+
+  // Only messages we can both attribute and key the anti-loop memory with.
+  const inbound = (obs?.nonCombat?.inboundMessages || []).filter(
+    (entry) => typeof entry?.senderID === "string" && entry.senderID.length > 0,
+  );
+  if (inbound.length === 0) {
+    return chooseMessageOpener(offers, obs, answered, dealMove, maxChars);
+  }
+
+  // Newest by turn; on a tie the later inbox entry wins, since the server
+  // appends newest last. No clock and no randomness: same inbox, same pick.
+  let newest = inbound[0];
+  for (const entry of inbound) {
+    if (Number(entry.turnNumber ?? 0) >= Number(newest.turnNumber ?? 0)) {
+      newest = entry;
+    }
+  }
+  const senderID = newest.senderID;
+  // One reply per inbound MESSAGE. This alone does not bound an exchange --
+  // it only stops us answering the same message twice -- so the lifetime budget
+  // below is what actually ends a conversation. Deliberately NOT falling
+  // through to an opener here: having just declined to repeat ourselves,
+  // opening a second conversation would be chatter.
+  const key = `${senderID}:${newest.turnNumber}`;
+  if (answered.has(key)) return null;
+
+  // Lifetime reply budget for this counterparty: sequential slot keys in the
+  // same match-scoped memory, so no extra state and no signature change.
+  let repliesSpent = 0;
+  while (
+    repliesSpent < MESSAGE_MAX_REPLIES_PER_RIVAL &&
+    answered.has(`reply:${senderID}:${repliesSpent}`)
+  ) {
+    repliesSpent += 1;
+  }
+  if (repliesSpent >= MESSAGE_MAX_REPLIES_PER_RIVAL) return null;
+
+  const offer = offers.find(
+    (action) => action.metadata?.recipientID === senderID,
+  );
+  // Never fabricate an id. If the sender is not on this decision's menu we say
+  // nothing rather than writing to whoever happens to be offered instead.
+  if (!offer) return null;
+
+  const rival = (obs?.visiblePlayers || []).find(
+    (player) => player?.playerID === senderID,
+  );
+  const hasOpenDeal = [
+    ...(obs?.deals?.incomingProposals || []),
+    ...(obs?.deals?.outgoingProposals || []),
+    ...(obs?.deals?.activeDeals || []),
+  ].some(
+    (view) =>
+      view?.proposerPlayerID === senderID ||
+      view?.recipientPlayerID === senderID,
+  );
+
+  let text;
+  if (provenDealBreaker(obs, senderID)) text = MESSAGE_REPLIES.breaker;
+  else if (rival?.isAllied) text = MESSAGE_REPLIES.ally;
+  else if (hasOpenDeal) text = MESSAGE_REPLIES.dealOpen;
+  else text = MESSAGE_REPLIES.neutral;
+
+  // Reject rather than slice or normalize. The exact string below is the
+  // string serialized on the wire when it passes.
+  if (typeof text !== "string" || text.length > maxChars) return null;
+
+  answered.add(key);
+  answered.add(`reply:${senderID}:${repliesSpent}`);
+  return { id: offer.id, text };
+}
+
+// Speaks first, but rarely, and only where there is something concrete to say:
+//   (a) we are proposing a deal to this rival on this very decision - the
+//       message is the reason to accept, which the bare template lacks;
+//   (b) we share a border with a rival we have never written to.
+function chooseMessageOpener(
+  offers,
+  obs,
+  answered,
+  dealMove,
+  maxChars = MESSAGE_MAX_CHARS,
+) {
+  const dealRecipient =
+    dealMove?.kind === "deal_propose" ? dealMove?.metadata?.recipientID : null;
+  if (dealRecipient) {
+    const offer = offers.find(
+      (action) => action.metadata?.recipientID === dealRecipient,
+    );
+    const key = `opener:${dealRecipient}`;
+    if (
+      offer &&
+      !answered.has(key) &&
+      MESSAGE_OPENERS.withProposal.length <= maxChars
+    ) {
+      answered.add(key);
+      return {
+        id: offer.id,
+        text: MESSAGE_OPENERS.withProposal,
+      };
+    }
+  }
+
+  // The menu is already ranked by the game, so taking the first eligible offer
+  // is both stable and the most relevant counterparty on offer.
+  for (const offer of offers) {
+    const recipientID = offer.metadata?.recipientID;
+    const key = `opener:${recipientID}`;
+    if (answered.has(key)) continue;
+    const rival = (obs?.visiblePlayers || []).find(
+      (player) => player?.playerID === recipientID,
+    );
+    // Borderers only - an ally has nothing left to negotiate, and somebody
+    // already proven unreliable is not worth the opening line.
+    if (!rival?.sharesBorder || rival.isAllied) continue;
+    if (provenDealBreaker(obs, recipientID)) continue;
+    if (MESSAGE_OPENERS.border.length > maxChars) continue;
+    answered.add(key);
+    return {
+      id: offer.id,
+      text: MESSAGE_OPENERS.border,
+    };
+  }
+  return null;
 }
